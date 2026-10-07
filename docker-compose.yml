@@ -1,0 +1,9 @@
+services:
+  vmcheck:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vmcheck-stack-validator:latest
+    init: true
+    # 用法：docker compose run --rm vmcheck /app/examples/valid.json
+    # 或：docker compose run --rm -T vmcheck < program.json

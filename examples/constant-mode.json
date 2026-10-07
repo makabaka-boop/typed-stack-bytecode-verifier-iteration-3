@@ -1,0 +1,10 @@
+{
+  "mode": "constants",
+  "instructions": [
+    { "op": "PUSH_BOOL", "value": true },
+    { "op": "JUMP_IF_FALSE", "target": 4 },
+    { "op": "PUSH_BOOL", "value": true },
+    { "op": "HALT" },
+    { "op": "BROKEN" }
+  ]
+}

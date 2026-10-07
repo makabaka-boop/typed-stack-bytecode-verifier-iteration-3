@@ -1,0 +1,10 @@
+{
+  "instructions": [
+    { "op": "PUSH_BOOL", "value": true },
+    { "op": "JUMP_IF_FALSE", "target": 4 },
+    { "op": "PUSH_BOOL", "value": false },
+    { "op": "JUMP", "target": 5 },
+    { "op": "PUSH_BOOL", "value": true },
+    { "op": "HALT" }
+  ]
+}

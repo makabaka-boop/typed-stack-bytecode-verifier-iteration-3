@@ -1,0 +1,21 @@
+{
+  "name": "vmcheck-stack-validator",
+  "version": "1.0.0",
+  "private": true,
+  "description": "JSON command-line validator for the vmcheck stack-machine instruction set",
+  "main": "dist/validator.js",
+  "bin": {
+    "vmcheck": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc --noEmit -p tsconfig.json",
+    "start": "node dist/cli.js",
+    "test": "npm run build && vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0",
+    "vitest": "^3.0.0"
+  }
+}

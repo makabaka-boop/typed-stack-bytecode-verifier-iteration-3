@@ -1,0 +1,9 @@
+{
+  "registers": 1,
+  "instructions": [
+    { "op": "PUSH_BOOL", "value": true },
+    { "op": "STORE", "slot": 0 },
+    { "op": "LOAD", "slot": 0 },
+    { "op": "HALT" }
+  ]
+}

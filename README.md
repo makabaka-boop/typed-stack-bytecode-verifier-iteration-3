@@ -24,6 +24,22 @@
 ]
 ```
 
+包装对象还可以声明 0～4 个局部寄存器（顶层数组形式没有寄存器）：
+
+```json
+{
+  "registers": 1,
+  "instructions": [
+    { "op": "PUSH_BOOL", "value": true },
+    { "op": "STORE", "slot": 0 },
+    { "op": "LOAD", "slot": 0 },
+    { "op": "HALT" }
+  ]
+}
+```
+
+`registers` 不是 0～4 的整数时，整次输入以 `structural_error`（`invalid_register_count`）拒绝，不返回半份报告。
+
 支持的指令：
 
 | 指令 | 操作数 | 栈语义 |
@@ -37,14 +53,19 @@
 | `POP` | 无 | 弹出栈顶 |
 | `JUMP` | `target: integer` | 绝对地址跳转，目标必须在程序范围内 |
 | `JUMP_IF_FALSE` | `target: integer` | 弹出一个 `bool`；真分支落到下一条，假分支跳到 `target` |
+| `STORE` | `slot: integer` | 弹出栈顶写入寄存器 `slot` |
+| `LOAD` | `slot: integer` | 读取寄存器 `slot` 压栈；寄存器未赋值时读取失败 |
 | `HALT` | 无 | 停机；此时栈必须恰好有一个 `bool` |
 
 校验规则：
 
 - 最大允许栈深为 32。
 - 每个可达 PC 只能有一个入栈类型序列；不同入边产生不同序列时报 `stack_merge_conflict`。
+- 寄存器初始全部未赋值；只有所有可达路径都赋过值，读取才合法，否则报 `register_read_unassigned`。
+- 控制流合流时同时传播栈状态与每个寄存器的确定赋值状态：任一入边未赋值则合流后仍未赋值；两条入边赋予不同类型时报 `register_merge_conflict`，见证同时给出两条入边的寄存器状态和完整路径。
+- 可达的槽位越界（`slot` 超出已配置寄存器数量）报 `register_slot_out_of_range`。
 - 可达的下溢、类型错误、越界跳转、栈溢出、非法 HALT 栈和末尾跌出都会使程序无效。
-- 不可达指令只列入 `deadPcs`，即使格式错误也不会触发校验错误。
+- 不可达指令只列入 `deadPcs`，即使格式错误、槽位越界或读取未赋值寄存器也不会触发校验错误。
 - 分析只跟踪类型，不跟踪具体布尔值，因此 `JUMP_IF_FALSE` 的两个分支都会按可达处理。
 - 固定栈状态的循环是允许的；不断改变栈类型序列的循环会在回边合流时被拒绝。
 
@@ -61,6 +82,7 @@
 启用后的语义：
 
 - 栈状态除类型外还区分**可证明的常量**与**未知值**：`PUSH_INT`/`PUSH_BOOL` 产生常量，`ADD`/`EQ`/`NOT` 在常量输入上直接折叠，`DUP` 保留常量。
+- 寄存器同样跟踪常量：`STORE` 把栈槽位的常量状态写入寄存器，`LOAD` 把它压回栈；同型不同常量合流时寄存器也降为未知。
 - `JUMP_IF_FALSE` 的条件是可证明常量时，只沿实际会走的边传播；另一条边证明不可达，其上的指令（哪怕是坏指令）只列入 `deadPcs`，也不再做越界检查。条件未知时保守探索两边。
 - 同一 PC 同型不同值的入边合流后，对应槽位拓宽为未知，并用合流后的状态**重新传播**后继——不会沿用首次到达时裁掉的后继。每个槽位最多从常量提升为未知一次，分析保证终止。
 - 类型冲突、栈深、HALT 与循环规则在两种模式下完全一致；只有证明确实不可达的指令才列入 `deadPcs`。
@@ -75,7 +97,17 @@
 node dist/cli.js --constants examples/const-pruned.json   # 退出码 0，坏指令证明不可达
 node dist/cli.js examples/const-pruned.json               # 默认模式：退出码 1，坏指令按可达处理
 node dist/cli.js examples/constant-mode.json              # 信封自带 "mode": "constants"
+node dist/cli.js examples/registers.json                  # 带局部寄存器的程序
 ```
+
+## 寄存器状态报告
+
+信封声明 `registers` 时，报告额外包含两个字段（省略该字段的旧程序输出逐字段不变）：
+
+- `analysis.registerCount`：已配置的寄存器数量；
+- `analysis.pcRegisterStates`：每个可达 PC 的寄存器入口状态，形如 `{ "kind": "unassigned" }`、`{ "kind": "unknown", "type": "int" }` 或常量模式下的 `{ "kind": "const", "type": "int", "value": 5 }`。
+
+寄存器状态与可达清单、错误见证来自同一次不动点传播；`register_merge_conflict` 的见证通过 `witness.registerConflict` 给出冲突槽位、双方寄存器状态和两条从 PC 0 出发的完整路径。
 
 ## 本地运行
 
@@ -120,7 +152,8 @@ node dist/cli.js < examples/valid.json
 - 普通操作错误：`witness.path` 加 `witness.attempted`；
 - 越界跳转：`witness.attempted.type === "jump"`；
 - 末尾跌出：`witness.attempted.type === "fall_through"`；
-- 合流冲突：`witness.conflicts` 同时包含两条入边的栈序列和完整路径。
+- 栈合流冲突：`witness.conflicts` 同时包含两条入边的栈序列和完整路径；
+- 寄存器合流冲突：`witness.registerConflict` 同时包含冲突槽位、两条入边的寄存器状态和完整路径。
 
 ## Docker Compose
 
@@ -149,4 +182,5 @@ Vitest 覆盖：
 - 越界跳转、末尾跌出、下溢、类型错误和 HALT 栈约束；
 - 对 8 个直线指令生成全部 1～4 长度小程序（共 4680 个），与独立参考抽象状态枚举器逐项对拍；
 - 常量感知模式：常量分支剪枝、回边把循环携带值拓宽为未知、合流后重新传播并探索此前裁掉的后继、证明不可达的坏指令、非法模式整次拒绝，以及用独立的小程序具体执行器核对可达集合、最大栈深与错误报告；默认模式在各入口结果逐字段不变；
-- CLI 文件输入、stdin 输入、模式参数（`--constants`/`--types`/`--mode`、信封 `mode` 字段与覆盖优先级）和退出码。
+- 局部寄存器：分支合流、回边携带、未赋值读取（含合流后才退化为未赋值的情形）、双路径类型冲突的 `register_merge_conflict`（带双方真实路径）、常量模式下同型不同常量合流降未知并重新传播、不可达的非法读取与越界槽位只列入 `deadPcs`、槽位越界与非法寄存器数量整次拒绝、省略寄存器配置的旧程序逐字段保持原结果，以及对 10 个直线指令（含 `STORE`/`LOAD`）生成全部 1～4 长度小程序（共 11110 个）与独立具体执行器逐项对拍；
+- CLI 文件输入、stdin 输入、模式参数（`--constants`/`--types`/`--mode`、信封 `mode` 字段与覆盖优先级）、寄存器程序报告和退出码。

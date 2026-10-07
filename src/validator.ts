@@ -1,6 +1,7 @@
 export const MIN_PROGRAM_LENGTH = 1;
 export const MAX_PROGRAM_LENGTH = 500;
 export const MAX_STACK_DEPTH = 32;
+export const MAX_REGISTERS = 4;
 
 export type StackType = 'int' | 'bool';
 
@@ -20,6 +21,12 @@ export type ValueState =
   | { kind: 'const'; type: 'bool'; value: boolean }
   | { kind: 'unknown'; type: StackType };
 
+/**
+ * 单个局部寄存器的抽象状态：初始未赋值；赋值后与栈槽位一样，
+ * 在常量感知模式下区分可证明的常量与未知值，类型部分始终精确。
+ */
+export type RegisterState = { kind: 'unassigned' } | ValueState;
+
 export type OpCode =
   | 'PUSH_INT'
   | 'PUSH_BOOL'
@@ -30,6 +37,8 @@ export type OpCode =
   | 'POP'
   | 'JUMP'
   | 'JUMP_IF_FALSE'
+  | 'STORE'
+  | 'LOAD'
   | 'HALT';
 
 export interface PushIntInstruction {
@@ -56,12 +65,24 @@ export interface JumpIfFalseInstruction {
   target: number;
 }
 
+export interface StoreInstruction {
+  op: 'STORE';
+  slot: number;
+}
+
+export interface LoadInstruction {
+  op: 'LOAD';
+  slot: number;
+}
+
 export type Instruction =
   | PushIntInstruction
   | PushBoolInstruction
   | NoOperandInstruction
   | JumpInstruction
-  | JumpIfFalseInstruction;
+  | JumpIfFalseInstruction
+  | StoreInstruction
+  | LoadInstruction;
 
 export type DecodedInstruction =
   | { ok: true; pc: number; instruction: Instruction }
@@ -75,7 +96,8 @@ export type DecodedInstruction =
         | 'unsupported_op'
         | 'missing_integer_value'
         | 'missing_boolean_value'
-        | 'missing_integer_target';
+        | 'missing_integer_target'
+        | 'missing_integer_slot';
     };
 
 export interface AttemptedOperation {
@@ -120,12 +142,21 @@ export interface MergeConflictWitness {
   incomingPath: WitnessEdge[];
 }
 
+export interface RegisterMergeConflictWitness {
+  slot: number;
+  existing: RegisterState;
+  incoming: RegisterState;
+  existingPath: WitnessEdge[];
+  incomingPath: WitnessEdge[];
+}
+
 export interface Witness {
   startPc: 0;
   entryStack: StackType[];
   path: WitnessEdge[];
   attempted?: AttemptedEdge;
   conflicts?: MergeConflictWitness;
+  registerConflict?: RegisterMergeConflictWitness;
 }
 
 export interface ValidationIssue {
@@ -142,14 +173,20 @@ export interface StructuralIssue {
     | 'input_not_object'
     | 'instructions_not_array'
     | 'instruction_count_out_of_range'
-    | 'invalid_mode';
+    | 'invalid_mode'
+    | 'invalid_register_count';
   message: string;
   details?: Record<string, unknown>;
 }
 
-interface WorkItem {
-  pc: number;
+/** 沿控制流传播的完整抽象状态：栈序列加上每个局部寄存器的赋值状态。 */
+interface FlowState {
   stack: ValueState[];
+  registers: RegisterState[];
+}
+
+interface WorkItem extends FlowState {
+  pc: number;
   path: WitnessEdge[];
 }
 
@@ -164,6 +201,9 @@ interface AnalyzedProgram {
   /** 以下两个字段只在常量感知模式下出现，默认模式输出保持不变。 */
   mode?: AnalysisMode;
   pcStates?: Record<number, ValueState[]>;
+  /** 以下两个字段只在信封声明 registers 时出现，省略寄存器配置的旧程序输出保持不变。 */
+  registerCount?: number;
+  pcRegisterStates?: Record<number, RegisterState[]>;
 }
 
 export type ValidationResult =
@@ -246,6 +286,13 @@ export function decodeInstruction(
     return { ok: true, pc, instruction: { op, target: record.target } };
   }
 
+  if (op === 'STORE' || op === 'LOAD') {
+    if (!isIntegerLike(record.slot)) {
+      return { ok: false, pc, op, reason: 'missing_integer_slot' };
+    }
+    return { ok: true, pc, instruction: { op, slot: record.slot } };
+  }
+
   return { ok: false, pc, op, reason: 'unsupported_op' };
 }
 
@@ -316,6 +363,46 @@ function mergeStacks(
   return merged;
 }
 
+function unassignedRegister(): RegisterState {
+  return { kind: 'unassigned' };
+}
+
+function cloneRegisters(registers: readonly RegisterState[]): RegisterState[] {
+  return registers.map((value) => ({ ...value }));
+}
+
+function sameRegisterState(left: RegisterState, right: RegisterState): boolean {
+  if (left.kind === 'unassigned' || right.kind === 'unassigned') {
+    return left.kind === right.kind;
+  }
+  return sameValueState(left, right);
+}
+
+function sameRegisterFile(
+  left: readonly RegisterState[],
+  right: readonly RegisterState[]
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every((value, index) => sameRegisterState(value, right[index]!))
+  );
+}
+
+/**
+ * 寄存器合流：任一入边尚未赋值则合流后仍视为未赋值（后续读取会失败）；
+ * 两条入边都赋过值但类型不同时无法合流，返回 null 由调用方报告冲突；
+ * 同型不同常量按栈槽位同样的规则拓宽为未知。
+ */
+function mergeRegisterStates(
+  left: RegisterState,
+  right: RegisterState
+): RegisterState | null {
+  if (left.kind === 'unassigned' || right.kind === 'unassigned') {
+    return unassignedRegister();
+  }
+  return mergeValueStates(left, right);
+}
+
 function cloneStack(stack: readonly StackType[]): StackType[] {
   return [...stack];
 }
@@ -328,6 +415,7 @@ function malformedMessage(reason: string): string {
     missing_integer_value: 'PUSH_INT 需要整数字段 value',
     missing_boolean_value: 'PUSH_BOOL 需要布尔字段 value',
     missing_integer_target: '跳转指令需要整数字段 target',
+    missing_integer_slot: 'STORE/LOAD 需要整数字段 slot',
   };
   return messages[reason] ?? '指令格式错误';
 }
@@ -357,6 +445,7 @@ function makeIssue(
   options: {
     attempted?: AttemptedEdge;
     conflicts?: MergeConflictWitness;
+    registerConflict?: RegisterMergeConflictWitness;
     details?: Record<string, unknown>;
   } = {}
 ): ValidationIssue {
@@ -371,6 +460,9 @@ function makeIssue(
   }
   if (options.conflicts) {
     witness.conflicts = options.conflicts;
+  }
+  if (options.registerConflict) {
+    witness.registerConflict = options.registerConflict;
   }
 
   return {
@@ -423,6 +515,29 @@ export function validateProgram(
     }
   }
 
+  // 寄存器数量同样属于信封：省略时按 0 个处理且输出保持旧格式；
+  // 非法数量必须整次拒绝，不能返回半份报告。
+  let registerCount = 0;
+  let registersConfigured = false;
+  if (!Array.isArray(input)) {
+    const record = input as Record<string, unknown>;
+    if ('registers' in record) {
+      if (
+        !isIntegerLike(record.registers) ||
+        record.registers < 0 ||
+        record.registers > MAX_REGISTERS
+      ) {
+        return structuralIssue(
+          'invalid_register_count',
+          `寄存器数量 registers 必须是 0 到 ${MAX_REGISTERS} 的整数`,
+          { registers: record.registers, min: 0, max: MAX_REGISTERS }
+        );
+      }
+      registersConfigured = true;
+      registerCount = record.registers;
+    }
+  }
+
   const rawInstructions = Array.isArray(input)
     ? input
     : (input as Record<string, unknown>).instructions;
@@ -463,10 +578,17 @@ export function validateProgram(
 
   const decoded = decodeProgram(rawInstructions);
   const programLength = decoded.length;
-  const arrivals = new Map<number, ValueState[]>();
+  const arrivals = new Map<number, FlowState>();
   const arrivalPaths = new Map<number, WitnessEdge[]>();
   const issueByPc = new Map<number, ValidationIssue>();
-  const queue: WorkItem[] = [{ pc: 0, stack: [], path: [] }];
+  const queue: WorkItem[] = [
+    {
+      pc: 0,
+      stack: [],
+      registers: Array.from({ length: registerCount }, () => unassignedRegister()),
+      path: [],
+    },
+  ];
   let maxStackDepth = 0;
 
   const recordDepth = (depth: number): void => {
@@ -477,29 +599,38 @@ export function validateProgram(
     // A later back/branch edge can reach a PC after BFS already evaluated one
     // predecessor. The merge mismatch is the controlling error at that PC and
     // must not be hidden by an issue observed through only one predecessor.
-    if (issue.code === 'stack_merge_conflict' || !issueByPc.has(issue.pc)) {
+    if (
+      issue.code === 'stack_merge_conflict' ||
+      issue.code === 'register_merge_conflict' ||
+      !issueByPc.has(issue.pc)
+    ) {
       issueByPc.set(issue.pc, issue);
     }
   };
 
   /**
-   * 返回继续传播所用的栈状态；无需继续（重复到达或类型冲突）时返回 null。
-   * 同型不同值合流时把槽位拓宽为未知并返回合流后的状态，调用方必须用
-   * 合流后的状态重新传播后继，不能沿用首次到达时裁掉的后继。
+   * 返回继续传播所用的状态；无需继续（重复到达或类型冲突）时返回 null。
+   * 栈与寄存器一起合流：栈类型序列不同报 stack_merge_conflict；两条入边
+   * 给同一寄存器赋予不同类型报 register_merge_conflict；同型不同常量或
+   * 赋值状态变弱时合流出更一般的状态，调用方必须用合流后的状态重新传播
+   * 后继，不能沿用首次到达时裁掉的后继。
    */
-  const arrive = (item: WorkItem): ValueState[] | null => {
+  const arrive = (item: WorkItem): FlowState | null => {
     const existing = arrivals.get(item.pc);
     if (existing === undefined) {
-      arrivals.set(item.pc, cloneValueStack(item.stack));
+      arrivals.set(item.pc, {
+        stack: cloneValueStack(item.stack),
+        registers: cloneRegisters(item.registers),
+      });
       arrivalPaths.set(item.pc, cloneWitnessPath(item.path));
-      return item.stack;
+      return { stack: item.stack, registers: item.registers };
     }
 
-    const merged = mergeStacks(existing, item.stack);
-    if (merged === null) {
+    const mergedStack = mergeStacks(existing.stack, item.stack);
+    if (mergedStack === null) {
       const existingPath = arrivalPaths.get(item.pc) ?? [];
       const conflicts: MergeConflictWitness = {
-        existingStack: stackTypes(existing),
+        existingStack: stackTypes(existing.stack),
         incomingStack: stackTypes(item.stack),
         existingPath: cloneWitnessPath(existingPath),
         incomingPath: cloneWitnessPath(item.path),
@@ -523,21 +654,65 @@ export function validateProgram(
       return null;
     }
 
-    if (sameValueStack(merged, existing)) {
+    const mergedRegisters: RegisterState[] = [];
+    for (let slot = 0; slot < existing.registers.length; slot += 1) {
+      const existingRegister = existing.registers[slot]!;
+      const incomingRegister = item.registers[slot]!;
+      const mergedRegister = mergeRegisterStates(existingRegister, incomingRegister);
+      if (mergedRegister === null) {
+        const existingPath = arrivalPaths.get(item.pc) ?? [];
+        const registerConflict: RegisterMergeConflictWitness = {
+          slot,
+          existing: { ...existingRegister },
+          incoming: { ...incomingRegister },
+          existingPath: cloneWitnessPath(existingPath),
+          incomingPath: cloneWitnessPath(item.path),
+        };
+        addIssue(
+          makeIssue(
+            item.pc,
+            'register_merge_conflict',
+            `PC ${item.pc} 的不同可达入边给寄存器 ${slot} 赋予了不同类型，控制流不能合流`,
+            stackTypes(item.stack),
+            item.path,
+            {
+              registerConflict,
+              details: {
+                slot,
+                existing: registerConflict.existing,
+                incoming: registerConflict.incoming,
+              },
+            }
+          )
+        );
+        return null;
+      }
+      mergedRegisters.push(mergedRegister);
+    }
+
+    if (
+      sameValueStack(mergedStack, existing.stack) &&
+      sameRegisterFile(mergedRegisters, existing.registers)
+    ) {
       return null;
     }
 
-    // 合流产生了更一般的状态（某些常量变成未知）：每个槽位最多只会
-    // 从常量提升为未知一次，因此重新传播必然终止。
-    arrivals.set(item.pc, cloneValueStack(merged));
+    // 合流产生了更一般的状态（常量变成未知，或寄存器从已赋值退化为未赋值）：
+    // 每个槽位的变化次数有界（常量最多提升为未知一次，已赋值最多退化为
+    // 未赋值一次且不可逆），因此重新传播必然终止。
+    arrivals.set(item.pc, {
+      stack: cloneValueStack(mergedStack),
+      registers: cloneRegisters(mergedRegisters),
+    });
     arrivalPaths.set(item.pc, cloneWitnessPath(item.path));
-    return merged;
+    return { stack: mergedStack, registers: mergedRegisters };
   };
 
   const enqueueSuccessor = (
     fromPc: number,
     toPc: number,
     stackAfter: ValueState[],
+    registersAfter: RegisterState[],
     pathAfter: WitnessEdge[],
     edgeType: WitnessEdge['type'],
     op: string
@@ -546,7 +721,7 @@ export function validateProgram(
       ...pathAfter,
       edge(edgeType, fromPc, toPc, op, stackAfter),
     ];
-    queue.push({ pc: toPc, stack: stackAfter, path: nextPath });
+    queue.push({ pc: toPc, stack: stackAfter, registers: registersAfter, path: nextPath });
   };
 
   while (queue.length > 0) {
@@ -555,12 +730,13 @@ export function validateProgram(
       continue;
     }
 
-    const stack = arrive(current);
-    if (stack === null) {
+    const state = arrive(current);
+    if (state === null) {
       continue;
     }
 
     const { pc, path } = current;
+    const { stack, registers } = state;
     recordDepth(stack.length);
 
     const decodedInstruction = decoded[pc];
@@ -616,7 +792,8 @@ export function validateProgram(
     const continueAt = (
       nextPc: number,
       stackAfter: ValueState[],
-      edgeType: WitnessEdge['type'] = 'fall'
+      edgeType: WitnessEdge['type'] = 'fall',
+      registersAfter: RegisterState[] = registers
     ): void => {
       recordDepth(stackAfter.length);
       if (nextPc >= programLength) {
@@ -640,13 +817,14 @@ export function validateProgram(
         );
         return;
       }
-      enqueueSuccessor(pc, nextPc, stackAfter, path, edgeType, op);
+      enqueueSuccessor(pc, nextPc, stackAfter, registersAfter, path, edgeType, op);
     };
 
     const jumpTo = (
       targetPc: number,
       stackAfter: ValueState[],
-      edgeType: 'jump' | 'true_branch' | 'false_branch'
+      edgeType: 'jump' | 'true_branch' | 'false_branch',
+      registersAfter: RegisterState[] = registers
     ): void => {
       recordDepth(stackAfter.length);
       if (targetPc < 0 || targetPc >= programLength) {
@@ -671,7 +849,7 @@ export function validateProgram(
         );
         return;
       }
-      enqueueSuccessor(pc, targetPc, stackAfter, path, edgeType, op);
+      enqueueSuccessor(pc, targetPc, stackAfter, registersAfter, path, edgeType, op);
     };
 
     switch (instruction.op) {
@@ -822,6 +1000,59 @@ export function validateProgram(
         break;
       }
 
+      case 'STORE': {
+        if (instruction.slot < 0 || instruction.slot >= registerCount) {
+          operationIssue(
+            'register_slot_out_of_range',
+            `PC ${pc} 的 STORE 槽位 ${instruction.slot} 超出已配置的 ${registerCount} 个寄存器`,
+            { slot: instruction.slot, registerCount }
+          );
+          break;
+        }
+        if (stack.length < 1) {
+          underflow(1);
+          break;
+        }
+        const registersAfter = cloneRegisters(registers);
+        registersAfter[instruction.slot] = { ...stack[stack.length - 1]! };
+        continueAt(pc + 1, stack.slice(0, -1), 'fall', registersAfter);
+        break;
+      }
+
+      case 'LOAD': {
+        if (instruction.slot < 0 || instruction.slot >= registerCount) {
+          operationIssue(
+            'register_slot_out_of_range',
+            `PC ${pc} 的 LOAD 槽位 ${instruction.slot} 超出已配置的 ${registerCount} 个寄存器`,
+            { slot: instruction.slot, registerCount }
+          );
+          break;
+        }
+        const register = registers[instruction.slot]!;
+        if (register.kind === 'unassigned') {
+          operationIssue(
+            'register_read_unassigned',
+            `PC ${pc} 读取的寄存器 ${instruction.slot} 在一条可达路径上尚未赋值`,
+            { slot: instruction.slot }
+          );
+          break;
+        }
+        if (stack.length >= MAX_STACK_DEPTH) {
+          operationIssue(
+            'stack_overflow',
+            `PC ${pc} 读取寄存器入栈将超过最大栈深 ${MAX_STACK_DEPTH}`,
+            {
+              maxStackDepth: MAX_STACK_DEPTH,
+              attemptedSize: stack.length + 1,
+            },
+            stackTypes([...stack, register])
+          );
+          break;
+        }
+        continueAt(pc + 1, [...stack, { ...register }]);
+        break;
+      }
+
       case 'JUMP': {
         jumpTo(instruction.target, cloneValueStack(stack), 'jump');
         break;
@@ -881,7 +1112,7 @@ export function validateProgram(
 
   const reachablePcs = [...arrivals.keys()].sort((a, b) => a - b);
   const pcSignatures = Object.fromEntries(
-    reachablePcs.map((pc) => [pc, stackTypes(arrivals.get(pc) ?? [])])
+    reachablePcs.map((pc) => [pc, stackTypes(arrivals.get(pc)?.stack ?? [])])
   );
   const deadPcs = decoded
     .map((_, pc) => pc)
@@ -909,7 +1140,16 @@ export function validateProgram(
     // pcStates 只是同一份到达状态的常量视角，保证四处不描述不同的控制流。
     analysis.mode = 'constants';
     analysis.pcStates = Object.fromEntries(
-      reachablePcs.map((pc) => [pc, cloneValueStack(arrivals.get(pc) ?? [])])
+      reachablePcs.map((pc) => [pc, cloneValueStack(arrivals.get(pc)?.stack ?? [])])
+    );
+  }
+
+  if (registersConfigured) {
+    // 寄存器状态同样来自同一次不动点传播：每个可达 PC 的入口赋值状态
+    // 与 reachablePcs、错误见证描述的是同一份控制流。
+    analysis.registerCount = registerCount;
+    analysis.pcRegisterStates = Object.fromEntries(
+      reachablePcs.map((pc) => [pc, cloneRegisters(arrivals.get(pc)?.registers ?? [])])
     );
   }
 

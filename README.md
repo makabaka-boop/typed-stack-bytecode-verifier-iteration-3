@@ -37,6 +37,8 @@
 | `POP` | 无 | 弹出栈顶 |
 | `JUMP` | `target: integer` | 绝对地址跳转，目标必须在程序范围内 |
 | `JUMP_IF_FALSE` | `target: integer` | 弹出一个 `bool`；真分支落到下一条，假分支跳到 `target` |
+| `STORE` | `slot: integer` | 弹出栈顶写入局部寄存器 `slot` |
+| `LOAD` | `slot: integer` | 读取局部寄存器 `slot` 并压栈；寄存器必须已在所有可达路径上赋值 |
 | `HALT` | 无 | 停机；此时栈必须恰好有一个 `bool` |
 
 校验规则：
@@ -47,6 +49,37 @@
 - 不可达指令只列入 `deadPcs`，即使格式错误也不会触发校验错误。
 - 分析只跟踪类型，不跟踪具体布尔值，因此 `JUMP_IF_FALSE` 的两个分支都会按可达处理。
 - 固定栈状态的循环是允许的；不断改变栈类型序列的循环会在回边合流时被拒绝。
+
+## 局部寄存器（可选）
+
+包装对象可以声明 0～4 个局部寄存器，供设备控制脚本暂存中间结果：
+
+```json
+{
+  "registers": 1,
+  "instructions": [
+    { "op": "PUSH_BOOL", "value": true },
+    { "op": "STORE", "slot": 0 },
+    { "op": "LOAD", "slot": 0 },
+    { "op": "HALT" }
+  ]
+}
+```
+
+- `registers` 必须是 0～4 的整数，否则整次输入以 `structural_error`（`invalid_register_count`）拒绝，不返回半份报告；省略该字段的旧程序逐字段保持原结果（此时任何可达的 `STORE`/`LOAD` 都因槽位越界而失败）。
+- 寄存器初始全部未赋值。分析沿每条控制流边同时传播栈状态与各寄存器的**确定赋值状态**（must 分析）：
+  - 任一路径未赋值就合流为未赋值，之后的 `LOAD` 报 `register_read_unassigned`；死代码里的非法读取只列入 `deadPcs`，不误报。
+  - 两条路径对同一寄存器赋予不同类型时报 `register_merge_conflict`，`witness.conflicts.register` 给出冲突槽位与双方类型，`existingPath`/`incomingPath` 给出两条真实路径。
+  - 常量感知模式下，同型不同常量的赋值合流后拓宽为未知，并用合流后的状态重新传播受影响的后继。
+- `slot` 越界（负数或不小于寄存器数量）在可达路径上报 `register_slot_out_of_bounds`；`slot` 不是整数时按 `malformed_instruction`（`missing_integer_slot`）处理。
+- 配置寄存器后，报告额外包含两个字段（未配置时一个不多）：
+  - `analysis.registerCount`：信封声明的寄存器数量；
+  - `analysis.pcRegisters`：每个可达 PC 的各槽位确定赋值状态，`null` 表示未赋值，否则与 `pcStates` 同形（类型模式下 `kind` 恒为 `"unknown"`）。
+- 可达清单、最大栈深、错误见证、`pcSignatures`/`pcStates` 与 `pcRegisters` 来自同一次不动点传播，描述同一份控制流。
+
+```bash
+node dist/cli.js examples/registers.json                  # 退出码 0，输出各 PC 的寄存器赋值状态
+```
 
 ## 常量感知模式（默认关闭）
 
@@ -120,7 +153,7 @@ node dist/cli.js < examples/valid.json
 - 普通操作错误：`witness.path` 加 `witness.attempted`；
 - 越界跳转：`witness.attempted.type === "jump"`；
 - 末尾跌出：`witness.attempted.type === "fall_through"`；
-- 合流冲突：`witness.conflicts` 同时包含两条入边的栈序列和完整路径。
+- 合流冲突：`witness.conflicts` 同时包含两条入边的栈序列和完整路径；寄存器类型冲突另附 `witness.conflicts.register`。
 
 ## Docker Compose
 
@@ -149,4 +182,5 @@ Vitest 覆盖：
 - 越界跳转、末尾跌出、下溢、类型错误和 HALT 栈约束；
 - 对 8 个直线指令生成全部 1～4 长度小程序（共 4680 个），与独立参考抽象状态枚举器逐项对拍；
 - 常量感知模式：常量分支剪枝、回边把循环携带值拓宽为未知、合流后重新传播并探索此前裁掉的后继、证明不可达的坏指令、非法模式整次拒绝，以及用独立的小程序具体执行器核对可达集合、最大栈深与错误报告；默认模式在各入口结果逐字段不变；
-- CLI 文件输入、stdin 输入、模式参数（`--constants`/`--types`/`--mode`、信封 `mode` 字段与覆盖优先级）和退出码。
+- 局部寄存器：分支合流（同型赋值、单路径未赋值读取、类型冲突的双方路径见证）、回边拓宽与重新传播、不可达坏寄存器指令、槽位越界与非法 `registers` 信封整次拒绝，并用带寄存器的独立具体执行器对 12 个直线指令生成全部 1～3 长度小程序（共 1884 个）逐项对拍；省略寄存器配置的旧程序逐字段保持原结果；
+- CLI 文件输入、stdin 输入、模式参数（`--constants`/`--types`/`--mode`、信封 `mode` 字段与覆盖优先级）、寄存器信封和退出码。

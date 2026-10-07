@@ -7,6 +7,7 @@ const validExample = join(process.cwd(), 'examples', 'valid.json');
 const invalidExample = join(process.cwd(), 'examples', 'merge-conflict.json');
 const constPrunedExample = join(process.cwd(), 'examples', 'const-pruned.json');
 const constantModeExample = join(process.cwd(), 'examples', 'constant-mode.json');
+const registersExample = join(process.cwd(), 'examples', 'registers.json');
 
 function runCli(args: string[], input?: string) {
   return spawnSync(process.execPath, [cliPath, ...args], {
@@ -101,6 +102,46 @@ describe('constant-aware mode selection', () => {
       ok: false,
       kind: 'structural_error',
       issue: { code: 'invalid_mode' },
+    });
+    expect(output).not.toHaveProperty('analysis');
+  });
+});
+
+describe('register envelope', () => {
+  it('exits 0 and reports register states for a valid register program', () => {
+    const result = runCli([registersExample]);
+    expect(result.status).toBe(0);
+    const output = JSON.parse(result.stdout);
+    expect(output.ok).toBe(true);
+    expect(output.analysis.registerCount).toBe(1);
+    expect(output.analysis.pcRegisters).toEqual({
+      0: [null],
+      1: [null],
+      2: [{ kind: 'unknown', type: 'bool' }],
+      3: [{ kind: 'unknown', type: 'bool' }],
+    });
+  });
+
+  it('exits 1 with a witness for an unassigned register read from stdin', () => {
+    const result = runCli(
+      [],
+      '{"registers":1,"instructions":[{"op":"LOAD","slot":0},{"op":"HALT"}]}'
+    );
+    expect(result.status).toBe(1);
+    const output = JSON.parse(result.stdout);
+    expect(output.analysis.issues[0].code).toBe('register_read_unassigned');
+    expect(output.analysis.issues[0].witness.path).toEqual([]);
+    expect(output.analysis.reachablePcs).toContain(0);
+  });
+
+  it('rejects an invalid register count without a partial report', () => {
+    const result = runCli([], '{"registers":5,"instructions":[{"op":"HALT"}]}');
+    expect(result.status).toBe(1);
+    const output = JSON.parse(result.stdout);
+    expect(output).toMatchObject({
+      ok: false,
+      kind: 'structural_error',
+      issue: { code: 'invalid_register_count' },
     });
     expect(output).not.toHaveProperty('analysis');
   });
